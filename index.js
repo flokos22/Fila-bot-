@@ -85,7 +85,7 @@ const filaX1 = [];
 const partidas = new Map();
 
 // =====================================================
-// CATEGORIAS
+// CRIAR CATEGORIA
 // =====================================================
 
 async function criarCategoria(guild, nome, staff = false) {
@@ -109,7 +109,7 @@ async function criarCategoria(guild, nome, staff = false) {
         });
     }
 
-    return guild.channels.create({
+    return await guild.channels.create({
         name: nome,
         type: ChannelType.GuildCategory,
         permissionOverwrites
@@ -117,7 +117,7 @@ async function criarCategoria(guild, nome, staff = false) {
 }
 
 // =====================================================
-// CANAIS
+// CRIAR CANAL
 // =====================================================
 
 async function criarCanal(
@@ -152,7 +152,7 @@ async function criarCanal(
         });
     }
 
-    return guild.channels.create({
+    return await guild.channels.create({
         name: nome,
         type: ChannelType.GuildText,
         parent: categoria.id,
@@ -161,7 +161,7 @@ async function criarCanal(
 }
 
 // =====================================================
-// SETUP
+// CONFIGURAR SERVIDOR
 // =====================================================
 
 async function configurarServidor(guild) {
@@ -208,15 +208,10 @@ function criarPainelFila() {
 
     const embed = new EmbedBuilder()
         .setColor(0x5865F2)
-        .setTitle("⚔️  EFOOTBALL • FILA X1")
+        .setTitle("⚔️ EFOOTBALL • FILA X1")
         .setDescription(
-            "```ansi\n" +
-            "        MATCHMAKING X1\n" +
-            "```\n" +
-
-            "Entre na fila e aguarde outro jogador. " +
-            "Quando dois jogadores estiverem disponíveis, " +
-            "o bot criará automaticamente uma sala privada para a partida.\n\n" +
+            "Entre na fila e aguarde um adversário.\n" +
+            "Quando dois jogadores entrarem, uma sala privada será criada automaticamente.\n\n" +
 
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
 
@@ -227,9 +222,7 @@ function criarPainelFila() {
 
             "🎮 **Modo:** X1\n" +
             "⚡ **Jogadores necessários:** 2\n" +
-            "🔒 **Sala:** Privada\n\n" +
-
-            "Clique em **ENTRAR NA FILA** para procurar um adversário."
+            "🔒 **Sala:** Privada"
         )
         .setFooter({
             text: "eFootball X1 • Matchmaking automático"
@@ -262,11 +255,7 @@ function criarPainelFila() {
 // CRIAR PARTIDA
 // =====================================================
 
-async function criarPartida(
-    guild,
-    jogador1,
-    jogador2
-) {
+async function criarPartida(guild, jogador1, jogador2) {
 
     const categoria = guild.channels.cache.find(
         canal =>
@@ -304,20 +293,18 @@ async function criarPartida(
 
     const canal = await guild.channels.create({
 
-        name:
-            `x1-${jogador1.slice(-4)}-${jogador2.slice(-4)}`,
+        name: `x1-${jogador1.slice(-4)}-${jogador2.slice(-4)}`,
 
         type: ChannelType.GuildText,
 
-        parent:
-            categoria?.id,
+        parent: categoria?.id,
 
         permissionOverwrites
     });
 
     const embed = new EmbedBuilder()
         .setColor(0x57F287)
-        .setTitle("⚔️  X1 ENCONTRADO!")
+        .setTitle("⚔️ X1 ENCONTRADO!")
         .setDescription(
             "O matchmaking encontrou dois jogadores.\n\n" +
 
@@ -330,8 +317,6 @@ async function criarPartida(
             "🔒 **Sala:** Privada\n\n" +
 
             "Entrem na partida e realizem o confronto no eFootball.\n\n" +
-
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
 
             "📌 **Boa partida!**"
         )
@@ -360,32 +345,31 @@ async function criarPartida(
 
 client.once("ready", async () => {
 
-    console.log(
-        `🤖 Bot conectado como ${client.user.tag}`
-    );
+    console.log(`🤖 Bot conectado como ${client.user.tag}`);
 
     const comandos = [
 
         new SlashCommandBuilder()
             .setName("setup")
-            .setDescription(
-                "Configura a estrutura do servidor"
-            ),
+            .setDescription("Configura a estrutura do servidor"),
 
         new SlashCommandBuilder()
             .setName("painel")
-            .setDescription(
-                "Envia o painel da fila X1"
-            )
+            .setDescription("Envia o painel da fila X1")
     ];
 
     try {
 
+        // Registra os comandos
         await client.application.commands.set(
             comandos.map(comando => comando.toJSON())
         );
 
-        console.log("✅ Comandos registrados.");
+        console.log("✅ /setup e /painel registrados.");
+
+        console.log(
+            `🌐 Bot está em ${client.guilds.cache.size} servidor(es).`
+        );
 
     } catch (erro) {
 
@@ -400,190 +384,169 @@ client.once("ready", async () => {
 // INTERAÇÕES
 // =====================================================
 
-client.on(
-    "interactionCreate",
-    async interaction => {
+client.on("interactionCreate", async interaction => {
 
-        try {
+    try {
 
-            // =============================================
-            // /SETUP
-            // =============================================
+        // =================================================
+        // /SETUP
+        // =================================================
 
-            if (
-                interaction.isChatInputCommand() &&
-                interaction.commandName === "setup"
-            ) {
+        if (
+            interaction.isChatInputCommand() &&
+            interaction.commandName === "setup"
+        ) {
 
-                await interaction.deferReply({
-                    ephemeral: true
-                });
+            await interaction.deferReply({
+                ephemeral: true
+            });
 
-                await configurarServidor(
-                    interaction.guild
-                );
-
-                return interaction.editReply(
-                    "✅ Estrutura do servidor configurada."
-                );
-            }
-
-            // =============================================
-            // /PAINEL
-            // =============================================
-
-            if (
-                interaction.isChatInputCommand() &&
-                interaction.commandName === "painel"
-            ) {
-
-                if (
-                    interaction.channel.name !==
-                    "fila-x1"
-                ) {
-
-                    return interaction.reply({
-                        content:
-                            "❌ Use o comando `/painel` dentro do canal `⚔️・fila-x1`.",
-
-                        ephemeral: true
-                    });
-                }
-
-                await interaction.channel.send(
-                    criarPainelFila()
-                );
-
-                return interaction.reply({
-                    content:
-                        "✅ Painel da fila X1 enviado.",
-
-                    ephemeral: true
-                });
-            }
-
-            // =============================================
-            // BOTÕES
-            // =============================================
-
-            if (!interaction.isButton()) return;
-
-            // =============================================
-            // ENTRAR
-            // =============================================
-
-            if (
-                interaction.customId ===
-                "entrar_fila"
-            ) {
-
-                const jogador =
-                    interaction.user.id;
-
-                if (filaX1.includes(jogador)) {
-
-                    return interaction.reply({
-                        content:
-                            "❌ Você já está na fila.",
-
-                        ephemeral: true
-                    });
-                }
-
-                filaX1.push(jogador);
-
-                await interaction.update(
-                    criarPainelFila()
-                );
-
-                // =========================================
-                // X1 FORMADO
-                // =========================================
-
-                if (filaX1.length >= 2) {
-
-                    const jogador1 =
-                        filaX1.shift();
-
-                    const jogador2 =
-                        filaX1.shift();
-
-                    const canal =
-                        await criarPartida(
-                            interaction.guild,
-                            jogador1,
-                            jogador2
-                        );
-
-                    await interaction.channel.send(
-                        `⚔️ **X1 encontrado!** <#${canal.id}>`
-                    );
-
-                    await interaction.message.edit(
-                        criarPainelFila()
-                    );
-                }
-
-                return;
-            }
-
-            // =============================================
-            // SAIR
-            // =============================================
-
-            if (
-                interaction.customId ===
-                "sair_fila"
-            ) {
-
-                const jogador =
-                    interaction.user.id;
-
-                const index =
-                    filaX1.indexOf(jogador);
-
-                if (index === -1) {
-
-                    return interaction.reply({
-                        content:
-                            "❌ Você não está na fila.",
-
-                        ephemeral: true
-                    });
-                }
-
-                filaX1.splice(index, 1);
-
-                await interaction.update(
-                    criarPainelFila()
-                );
-
-                return;
-            }
-
-        } catch (erro) {
-
-            console.error(
-                "❌ Erro na interação:",
-                erro
+            await configurarServidor(
+                interaction.guild
             );
 
+            return await interaction.editReply(
+                "✅ Estrutura do servidor configurada."
+            );
+        }
+
+        // =================================================
+        // /PAINEL
+        // =================================================
+
+        if (
+            interaction.isChatInputCommand() &&
+            interaction.commandName === "painel"
+        ) {
+
             if (
-                interaction.isRepliable() &&
-                !interaction.replied &&
-                !interaction.deferred
+                interaction.channel.name !==
+                "⚔️・fila-x1"
             ) {
 
-                await interaction.reply({
+                return await interaction.reply({
                     content:
-                        "❌ Ocorreu um erro no bot.",
-
+                        "❌ Use o comando `/painel` dentro do canal `⚔️・fila-x1`.",
                     ephemeral: true
-                }).catch(() => {});
+                });
             }
+
+            await interaction.channel.send(
+                criarPainelFila()
+            );
+
+            return await interaction.reply({
+                content:
+                    "✅ Painel da fila X1 enviado.",
+                ephemeral: true
+            });
+        }
+
+        // =================================================
+        // BOTÕES
+        // =================================================
+
+        if (!interaction.isButton()) return;
+
+        // =================================================
+        // ENTRAR NA FILA
+        // =================================================
+
+        if (interaction.customId === "entrar_fila") {
+
+            const jogador = interaction.user.id;
+
+            if (filaX1.includes(jogador)) {
+
+                return await interaction.reply({
+                    content:
+                        "❌ Você já está na fila.",
+                    ephemeral: true
+                });
+            }
+
+            filaX1.push(jogador);
+
+            await interaction.update(
+                criarPainelFila()
+            );
+
+            // =================================================
+            // FORMAR X1
+            // =================================================
+
+            if (filaX1.length >= 2) {
+
+                const jogador1 = filaX1.shift();
+                const jogador2 = filaX1.shift();
+
+                const canal = await criarPartida(
+                    interaction.guild,
+                    jogador1,
+                    jogador2
+                );
+
+                await interaction.channel.send(
+                    `⚔️ **X1 encontrado!** <#${canal.id}>`
+                );
+
+                await interaction.message.edit(
+                    criarPainelFila()
+                );
+            }
+
+            return;
+        }
+
+        // =================================================
+        // SAIR DA FILA
+        // =================================================
+
+        if (interaction.customId === "sair_fila") {
+
+            const jogador = interaction.user.id;
+
+            const index = filaX1.indexOf(jogador);
+
+            if (index === -1) {
+
+                return await interaction.reply({
+                    content:
+                        "❌ Você não está na fila.",
+                    ephemeral: true
+                });
+            }
+
+            filaX1.splice(index, 1);
+
+            await interaction.update(
+                criarPainelFila()
+            );
+
+            return;
+        }
+
+    } catch (erro) {
+
+        console.error(
+            "❌ Erro na interação:",
+            erro
+        );
+
+        if (
+            interaction.isRepliable() &&
+            !interaction.replied &&
+            !interaction.deferred
+        ) {
+
+            await interaction.reply({
+                content:
+                    "❌ Ocorreu um erro no bot.",
+                ephemeral: true
+            }).catch(() => {});
         }
     }
-);
+});
 
 // =====================================================
 // LOGIN
@@ -602,9 +565,11 @@ if (!TOKEN) {
 
 client.login(TOKEN)
     .then(() => {
+
         console.log(
             "🔑 Login no Discord realizado."
         );
+
     })
     .catch(erro => {
 
