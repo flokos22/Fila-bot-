@@ -2,10 +2,6 @@ const http = require("http");
 
 const PORT = process.env.PORT || 3000;
 
-// =====================================================
-// SERVIDOR HTTP PARA O RENDER
-// =====================================================
-
 http.createServer((req, res) => {
     res.writeHead(200, {
         "Content-Type": "text/plain; charset=utf-8"
@@ -15,10 +11,6 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
     console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
 });
-
-// =====================================================
-// DISCORD
-// =====================================================
 
 const {
     Client,
@@ -33,13 +25,11 @@ const {
 } = require("discord.js");
 
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds
-    ]
+    intents: [GatewayIntentBits.Guilds]
 });
 
 // =====================================================
-// CONFIGURAÇÕES
+// CONFIGURAÇÃO
 // =====================================================
 
 const CATEGORIAS = {
@@ -88,16 +78,14 @@ const CANAIS = {
 };
 
 // =====================================================
-// FILA X1
+// FILA
 // =====================================================
 
 const filaX1 = [];
-
-// Partidas em andamento
 const partidas = new Map();
 
 // =====================================================
-// CRIAR CATEGORIA
+// CATEGORIAS
 // =====================================================
 
 async function criarCategoria(guild, nome, staff = false) {
@@ -110,10 +98,10 @@ async function criarCategoria(guild, nome, staff = false) {
 
     if (categoria) return categoria;
 
-    const permissions = [];
+    const permissionOverwrites = [];
 
     if (staff) {
-        permissions.push({
+        permissionOverwrites.push({
             id: guild.roles.everyone.id,
             deny: [
                 PermissionsBitField.Flags.ViewChannel
@@ -121,17 +109,15 @@ async function criarCategoria(guild, nome, staff = false) {
         });
     }
 
-    categoria = await guild.channels.create({
+    return guild.channels.create({
         name: nome,
         type: ChannelType.GuildCategory,
-        permissionOverwrites: permissions
+        permissionOverwrites
     });
-
-    return categoria;
 }
 
 // =====================================================
-// CRIAR CANAL
+// CANAIS
 // =====================================================
 
 async function criarCanal(
@@ -149,11 +135,10 @@ async function criarCanal(
 
     if (canal) return canal;
 
-    const permissions = [];
+    const permissionOverwrites = [];
 
     if (somenteLeitura) {
-
-        permissions.push({
+        permissionOverwrites.push({
             id: guild.roles.everyone.id,
 
             allow: [
@@ -167,37 +152,29 @@ async function criarCanal(
         });
     }
 
-    canal = await guild.channels.create({
+    return guild.channels.create({
         name: nome,
         type: ChannelType.GuildText,
         parent: categoria.id,
-        permissionOverwrites: permissions
+        permissionOverwrites
     });
-
-    return canal;
 }
 
 // =====================================================
-// CONFIGURAR SERVIDOR
+// SETUP
 // =====================================================
 
 async function configurarServidor(guild) {
 
-    console.log("⚙️ Iniciando configuração do servidor...");
-
     for (const [chave, nomeCategoria] of Object.entries(CATEGORIAS)) {
-
-        const staff = chave === "STAFF";
 
         const categoria = await criarCategoria(
             guild,
             nomeCategoria,
-            staff
+            chave === "STAFF"
         );
 
-        const canais = CANAIS[chave] || [];
-
-        for (const [nomeCanal, somenteLeitura] of canais) {
+        for (const [nomeCanal, somenteLeitura] of CANAIS[chave]) {
 
             await criarCanal(
                 guild,
@@ -208,56 +185,76 @@ async function configurarServidor(guild) {
         }
     }
 
-    console.log("✅ Servidor configurado.");
+    console.log("✅ Estrutura do servidor configurada.");
 }
 
 // =====================================================
 // PAINEL DA FILA
 // =====================================================
 
-function painelFila() {
+function criarPainelFila() {
 
-    let jogadores = "Ninguém está na fila.";
+    let jogadores = "Ninguém está aguardando.";
 
     if (filaX1.length > 0) {
 
         jogadores = filaX1
             .map(
                 (id, index) =>
-                    `${index + 1}. <@${id}>`
+                    `**${index + 1}.** <@${id}>`
             )
             .join("\n");
     }
 
     const embed = new EmbedBuilder()
-        .setTitle("⚔️ FILA X1 — EFOOTBALL")
+        .setColor(0x5865F2)
+        .setTitle("⚔️  EFOOTBALL • FILA X1")
         .setDescription(
-            "Entre na fila para encontrar um adversário.\n\n" +
-            `👥 **Jogadores na fila:** ${filaX1.length}/2\n\n` +
-            jogadores
-        )
-        .setColor(0x2b2d31)
-        .setFooter({
-            text: "eFootball X1"
-        });
+            "```ansi\n" +
+            "        MATCHMAKING X1\n" +
+            "```\n" +
 
-    const botoes = new ActionRowBuilder()
+            "Entre na fila e aguarde outro jogador. " +
+            "Quando dois jogadores estiverem disponíveis, " +
+            "o bot criará automaticamente uma sala privada para a partida.\n\n" +
+
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+            "👥 **JOGADORES NA FILA**\n" +
+            `${jogadores}\n\n` +
+
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+            "🎮 **Modo:** X1\n" +
+            "⚡ **Jogadores necessários:** 2\n" +
+            "🔒 **Sala:** Privada\n\n" +
+
+            "Clique em **ENTRAR NA FILA** para procurar um adversário."
+        )
+        .setFooter({
+            text: "eFootball X1 • Matchmaking automático"
+        })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder()
         .addComponents(
 
             new ButtonBuilder()
                 .setCustomId("entrar_fila")
                 .setLabel("ENTRAR NA FILA")
+                .setEmoji("⚔️")
                 .setStyle(ButtonStyle.Success),
 
             new ButtonBuilder()
                 .setCustomId("sair_fila")
                 .setLabel("SAIR DA FILA")
+                .setEmoji("🚪")
                 .setStyle(ButtonStyle.Danger)
         );
 
     return {
         embeds: [embed],
-        components: [botoes]
+        components: [row]
     };
 }
 
@@ -277,11 +274,10 @@ async function criarPartida(
             canal.name === CATEGORIAS.MATCHMAKING
     );
 
-    const permissoes = [
+    const permissionOverwrites = [
 
         {
             id: guild.roles.everyone.id,
-
             deny: [
                 PermissionsBitField.Flags.ViewChannel
             ]
@@ -289,7 +285,6 @@ async function criarPartida(
 
         {
             id: jogador1,
-
             allow: [
                 PermissionsBitField.Flags.ViewChannel,
                 PermissionsBitField.Flags.SendMessages,
@@ -299,7 +294,6 @@ async function criarPartida(
 
         {
             id: jogador2,
-
             allow: [
                 PermissionsBitField.Flags.ViewChannel,
                 PermissionsBitField.Flags.SendMessages,
@@ -316,33 +310,38 @@ async function criarPartida(
         type: ChannelType.GuildText,
 
         parent:
-            categoria ? categoria.id : undefined,
+            categoria?.id,
 
-        permissionOverwrites:
-            permissoes
+        permissionOverwrites
     });
 
     const embed = new EmbedBuilder()
-        .setTitle("⚔️ X1 ENCONTRADO")
+        .setColor(0x57F287)
+        .setTitle("⚔️  X1 ENCONTRADO!")
         .setDescription(
+            "O matchmaking encontrou dois jogadores.\n\n" +
+
             `👤 **Jogador 1:** <@${jogador1}>\n` +
             `👤 **Jogador 2:** <@${jogador2}>\n\n` +
 
-            "🎮 **Modo:** X1\n\n" +
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
 
-            "A partida foi encontrada!\n\n" +
+            "🎮 **Modo:** X1\n" +
+            "🔒 **Sala:** Privada\n\n" +
 
-            "Realizem a partida no eFootball.\n\n" +
+            "Entrem na partida e realizem o confronto no eFootball.\n\n" +
 
-            "Depois adicionaremos o sistema de confirmação " +
-            "e registro do resultado."
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+            "📌 **Boa partida!**"
         )
-        .setColor(0x2b2d31);
+        .setFooter({
+            text: "eFootball X1"
+        })
+        .setTimestamp();
 
     await canal.send({
-        content:
-            `<@${jogador1}> <@${jogador2}>`,
-
+        content: `<@${jogador1}> <@${jogador2}>`,
         embeds: [embed]
     });
 
@@ -365,26 +364,33 @@ client.once("ready", async () => {
         `🤖 Bot conectado como ${client.user.tag}`
     );
 
-    const comando = new SlashCommandBuilder()
-        .setName("setup")
-        .setDescription(
-            "Configura a estrutura do servidor"
-        );
+    const comandos = [
+
+        new SlashCommandBuilder()
+            .setName("setup")
+            .setDescription(
+                "Configura a estrutura do servidor"
+            ),
+
+        new SlashCommandBuilder()
+            .setName("painel")
+            .setDescription(
+                "Envia o painel da fila X1"
+            )
+    ];
 
     try {
 
-        await client.application.commands.set([
-            comando.toJSON()
-        ]);
-
-        console.log(
-            "✅ Comando /setup registrado."
+        await client.application.commands.set(
+            comandos.map(comando => comando.toJSON())
         );
+
+        console.log("✅ Comandos registrados.");
 
     } catch (erro) {
 
         console.error(
-            "❌ Erro ao registrar /setup:",
+            "❌ Erro ao registrar comandos:",
             erro
         );
     }
@@ -423,13 +429,47 @@ client.on(
             }
 
             // =============================================
+            // /PAINEL
+            // =============================================
+
+            if (
+                interaction.isChatInputCommand() &&
+                interaction.commandName === "painel"
+            ) {
+
+                if (
+                    interaction.channel.name !==
+                    "fila-x1"
+                ) {
+
+                    return interaction.reply({
+                        content:
+                            "❌ Use o comando `/painel` dentro do canal `⚔️・fila-x1`.",
+
+                        ephemeral: true
+                    });
+                }
+
+                await interaction.channel.send(
+                    criarPainelFila()
+                );
+
+                return interaction.reply({
+                    content:
+                        "✅ Painel da fila X1 enviado.",
+
+                    ephemeral: true
+                });
+            }
+
+            // =============================================
             // BOTÕES
             // =============================================
 
             if (!interaction.isButton()) return;
 
             // =============================================
-            // ENTRAR NA FILA
+            // ENTRAR
             // =============================================
 
             if (
@@ -453,11 +493,11 @@ client.on(
                 filaX1.push(jogador);
 
                 await interaction.update(
-                    painelFila()
+                    criarPainelFila()
                 );
 
                 // =========================================
-                // FORMOU X1
+                // X1 FORMADO
                 // =========================================
 
                 if (filaX1.length >= 2) {
@@ -480,7 +520,7 @@ client.on(
                     );
 
                     await interaction.message.edit(
-                        painelFila()
+                        criarPainelFila()
                     );
                 }
 
@@ -488,7 +528,7 @@ client.on(
             }
 
             // =============================================
-            // SAIR DA FILA
+            // SAIR
             // =============================================
 
             if (
@@ -515,7 +555,7 @@ client.on(
                 filaX1.splice(index, 1);
 
                 await interaction.update(
-                    painelFila()
+                    criarPainelFila()
                 );
 
                 return;
@@ -546,11 +586,10 @@ client.on(
 );
 
 // =====================================================
-// TOKEN
+// LOGIN
 // =====================================================
 
-const TOKEN =
-    process.env.DISCORD_TOKEN;
+const TOKEN = process.env.DISCORD_TOKEN;
 
 if (!TOKEN) {
 
@@ -561,17 +600,16 @@ if (!TOKEN) {
     process.exit(1);
 }
 
-// =====================================================
-// LOGIN
-// =====================================================
-
 client.login(TOKEN)
     .then(() => {
-        console.log("🔑 Login no Discord realizado.");
+        console.log(
+            "🔑 Login no Discord realizado."
+        );
     })
-    .catch((erro) => {
+    .catch(erro => {
+
         console.error(
-            "❌ Não foi possível conectar ao Discord:",
+            "❌ Erro ao conectar ao Discord:",
             erro
         );
 
