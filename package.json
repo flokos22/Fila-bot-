@@ -1,13 +1,17 @@
+
 {
-  "name": "efootball-x1-bot",
+  "name": "organizador-efootball",
   "version": "1.0.0",
-  "description": "Bot de matchmaking X1 para eFootball",
+  "description": "Bot para organizar servidor Discord de eFootball",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
   "dependencies": {
-    "discord.js": "^14.25.1",
-    "dotenv": "^17.2.2"
+    "discord.js": "^14.22.1"
+  },
+  "engines": {
+    "node": ">=20.11.0"
   }
 }
