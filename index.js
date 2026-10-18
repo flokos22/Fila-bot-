@@ -15,7 +15,6 @@ const {
   AttachmentBuilder,
   SlashCommandBuilder,
 } = require('discord.js');
-const { Pool } = require('pg');
 
 /* =====================================================================
    LÓGICA PURA
@@ -142,278 +141,178 @@ function logoPng() {
 }
 
 /* =====================================================================
-   BANCO DE DADOS (PostgreSQL)
+   ESTADO EM MEMÓRIA (zera quando o bot reinicia)
 ===================================================================== */
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false },
-  max: 5,
-});
-pool.on('error', (e) => console.error('Erro no pool PG:', e.message));
-
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS queues (
-  id SERIAL PRIMARY KEY,
-  guild_id TEXT NOT NULL,
-  channel_id TEXT NOT NULL,
-  message_id TEXT,
-  platform TEXT NOT NULL CHECK (platform IN ('mobile','emulador','unica')),
-  value INTEGER NOT NULL CHECK (value > 0 AND value <= 100),
-  UNIQUE (guild_id, platform, value)
-);
-CREATE TABLE IF NOT EXISTS queue_players (
-  queue_id INTEGER NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
-  guild_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (guild_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS matches (
-  id SERIAL PRIMARY KEY,
-  guild_id TEXT NOT NULL,
-  queue_id INTEGER REFERENCES queues(id) ON DELETE SET NULL,
-  channel_id TEXT NOT NULL,
-  message_id TEXT,
-  platform TEXT NOT NULL,
-  value INTEGER NOT NULL,
-  player1_id TEXT NOT NULL,
-  player2_id TEXT NOT NULL,
-  p1_confirmed BOOLEAN NOT NULL DEFAULT false,
-  p2_confirmed BOOLEAN NOT NULL DEFAULT false,
-  p1_report TEXT,
-  p2_report TEXT,
-  status TEXT NOT NULL DEFAULT 'confirming'
-    CHECK (status IN ('confirming','active','disputed','finished','cancelled')),
-  winner_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  finished_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_matches_guild_status ON matches (guild_id, status);
-`;
-
-const migrate = () => pool.query(SCHEMA);
-
 const OPEN = ['confirming', 'active', 'disputed'];
-
-async function tx(fn) {
-  const c = await pool.connect();
-  try {
-    await c.query('BEGIN');
-    const r = await fn(c);
-    await c.query('COMMIT');
-    return r;
-  } catch (e) {
-    await c.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally {
-    c.release();
-  }
-}
+const queues = new Map();
+const matches = new Map();
+let nextQueueId = 1;
+let nextMatchId = 1;
 
 const seat = (m, uid) => (m.player1_id === uid ? 1 : m.player2_id === uid ? 2 : 0);
-const lockMatch = async (c, id, guildId) =>
-  (await c.query('SELECT * FROM matches WHERE id=$1 AND guild_id=$2 FOR UPDATE', [id, guildId])).rows[0];
-const release = (c, m) =>
-  m.queue_id ? c.query('DELETE FROM queue_players WHERE queue_id=$1', [m.queue_id]) : null;
-
-async function finish(c, id, winnerId) {
-  const m = (
-    await c.query(
-      `UPDATE matches SET status='finished', winner_id=$2, finished_at=now() WHERE id=$1 RETURNING *`,
-      [id, winnerId],
-    )
-  ).rows[0];
-  await release(c, m);
+const getMatch = (id, guildId) => {
+  const m = matches.get(id);
+  return m && m.guild_id === guildId ? m : null;
+};
+const release = (m) => {
+  const q = queues.get(m.queue_id);
+  if (q) q.players = [];
+};
+const finish = (m, winnerId) => {
+  m.status = 'finished';
+  m.winner_id = winnerId;
+  release(m);
   return m;
-}
+};
 
 const svc = {};
 
-svc.createQueue = async (guildId, channelId, platform, value) =>
-  (
-    await pool.query(
-      'INSERT INTO queues (guild_id, channel_id, platform, value) VALUES ($1,$2,$3,$4) RETURNING *',
-      [guildId, channelId, platform, value],
-    )
-  ).rows[0];
-
-svc.setQueueMessage = (id, messageId) =>
-  pool.query('UPDATE queues SET message_id=$2 WHERE id=$1', [id, messageId]);
-
-svc.getQueue = async (id) => (await pool.query('SELECT * FROM queues WHERE id=$1', [id])).rows[0] || null;
-
-svc.listQueues = async (guildId) =>
-  (await pool.query('SELECT * FROM queues WHERE guild_id=$1 ORDER BY id', [guildId])).rows;
-
-svc.deleteQueues = (guildId) => pool.query('DELETE FROM queues WHERE guild_id=$1', [guildId]);
-
-svc.getPlayers = async (queueId) =>
-  (
-    await pool.query('SELECT user_id FROM queue_players WHERE queue_id=$1 ORDER BY joined_at, user_id', [
-      queueId,
-    ])
-  ).rows.map((r) => r.user_id);
-
-svc.openMatchCount = async (guildId) =>
-  (
-    await pool.query('SELECT count(*)::int AS c FROM matches WHERE guild_id=$1 AND status = ANY($2)', [
-      guildId,
-      OPEN,
-    ])
-  ).rows[0].c;
-
-svc.join = async (queueId, guildId, userId) => {
-  try {
-    return await tx(async (c) => {
-      const q = (await c.query('SELECT * FROM queues WHERE id=$1 FOR UPDATE', [queueId])).rows[0];
-      if (!q || q.guild_id !== guildId) return { ok: false, reason: 'not_found' };
-
-      const cur = (
-        await c.query('SELECT queue_id FROM queue_players WHERE guild_id=$1 AND user_id=$2', [guildId, userId])
-      ).rows[0];
-      if (cur) return { ok: false, reason: cur.queue_id === q.id ? 'already_here' : 'in_queue' };
-
-      const count = Number(
-        (await c.query('SELECT count(*) FROM queue_players WHERE queue_id=$1', [q.id])).rows[0].count,
-      );
-      if (count >= 2) return { ok: false, reason: 'full' };
-
-      await c.query('INSERT INTO queue_players (queue_id, guild_id, user_id) VALUES ($1,$2,$3)', [
-        q.id,
-        guildId,
-        userId,
-      ]);
-
-      let match = null;
-      if (count + 1 === 2) {
-        const [p1, p2] = (
-          await c.query('SELECT user_id FROM queue_players WHERE queue_id=$1 ORDER BY joined_at, user_id', [q.id])
-        ).rows.map((r) => r.user_id);
-        match = (
-          await c.query(
-            `INSERT INTO matches (guild_id, queue_id, channel_id, platform, value, player1_id, player2_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-            [guildId, q.id, q.channel_id, q.platform, q.value, p1, p2],
-          )
-        ).rows[0];
-      }
-      return { ok: true, queue: q, match };
-    });
-  } catch (e) {
-    if (e.code === '23505') return { ok: false, reason: 'in_queue' };
-    throw e;
-  }
+svc.reset = () => {
+  queues.clear();
+  matches.clear();
+  nextQueueId = 1;
+  nextMatchId = 1;
 };
 
-svc.leave = (queueId, guildId, userId) =>
-  tx(async (c) => {
-    const q = (await c.query('SELECT * FROM queues WHERE id=$1 FOR UPDATE', [queueId])).rows[0];
-    if (!q || q.guild_id !== guildId) return { ok: false, reason: 'not_found' };
-    const mine = (
-      await c.query('SELECT 1 FROM queue_players WHERE queue_id=$1 AND user_id=$2', [q.id, userId])
-    ).rows[0];
-    if (!mine) return { ok: false, reason: 'not_in_queue' };
-    const count = Number(
-      (await c.query('SELECT count(*) FROM queue_players WHERE queue_id=$1', [q.id])).rows[0].count,
-    );
-    if (count >= 2) return { ok: false, reason: 'in_match' };
-    await c.query('DELETE FROM queue_players WHERE queue_id=$1 AND user_id=$2', [q.id, userId]);
-    return { ok: true };
-  });
+svc.createQueue = (guildId, channelId, platform, value) => {
+  const q = { id: nextQueueId++, guild_id: guildId, channel_id: channelId, message_id: null, platform, value, players: [] };
+  queues.set(q.id, q);
+  return q;
+};
+svc.setQueueMessage = (id, messageId) => {
+  const q = queues.get(id);
+  if (q) q.message_id = messageId;
+};
+svc.getQueue = (id) => queues.get(id) || null;
+svc.listQueues = (guildId) => [...queues.values()].filter((q) => q.guild_id === guildId);
+svc.deleteQueues = (guildId) => svc.listQueues(guildId).forEach((q) => queues.delete(q.id));
+svc.getPlayers = (id) => [...(queues.get(id)?.players || [])];
+svc.openMatchCount = (guildId) =>
+  [...matches.values()].filter((m) => m.guild_id === guildId && OPEN.includes(m.status)).length;
+svc.setMatchMessage = (id, messageId) => {
+  const m = matches.get(id);
+  if (m) m.message_id = messageId;
+};
 
-svc.setMatchMessage = (id, messageId) =>
-  pool.query('UPDATE matches SET message_id=$2 WHERE id=$1', [id, messageId]);
+svc.join = (queueId, guildId, userId) => {
+  const q = queues.get(queueId);
+  if (!q || q.guild_id !== guildId) return { ok: false, reason: 'not_found' };
+  const cur = svc.listQueues(guildId).find((x) => x.players.includes(userId));
+  if (cur) return { ok: false, reason: cur.id === q.id ? 'already_here' : 'in_queue' };
+  if (q.players.length >= 2) return { ok: false, reason: 'full' };
+  q.players.push(userId);
+  let match = null;
+  if (q.players.length === 2) {
+    match = {
+      id: nextMatchId++,
+      guild_id: guildId,
+      queue_id: q.id,
+      channel_id: q.channel_id,
+      message_id: null,
+      platform: q.platform,
+      value: q.value,
+      player1_id: q.players[0],
+      player2_id: q.players[1],
+      p1_confirmed: false,
+      p2_confirmed: false,
+      p1_report: null,
+      p2_report: null,
+      status: 'confirming',
+      winner_id: null,
+    };
+    matches.set(match.id, match);
+  }
+  return { ok: true, queue: q, match };
+};
 
-svc.confirm = (id, guildId, userId) =>
-  tx(async (c) => {
-    const m = await lockMatch(c, id, guildId);
-    if (!m) return { ok: false, reason: 'not_found' };
-    const s = seat(m, userId);
-    if (!s) return { ok: false, reason: 'not_player' };
-    if (m.status !== 'confirming') return { ok: false, reason: 'bad_state' };
-    const col = s === 1 ? 'p1_confirmed' : 'p2_confirmed';
-    let row = (await c.query(`UPDATE matches SET ${col}=true WHERE id=$1 RETURNING *`, [id])).rows[0];
-    if (row.p1_confirmed && row.p2_confirmed) {
-      row = (await c.query(`UPDATE matches SET status='active' WHERE id=$1 RETURNING *`, [id])).rows[0];
-    }
-    return { ok: true, match: row };
-  });
+svc.leave = (queueId, guildId, userId) => {
+  const q = queues.get(queueId);
+  if (!q || q.guild_id !== guildId) return { ok: false, reason: 'not_found' };
+  if (!q.players.includes(userId)) return { ok: false, reason: 'not_in_queue' };
+  if (q.players.length >= 2) return { ok: false, reason: 'in_match' };
+  q.players = q.players.filter((p) => p !== userId);
+  return { ok: true };
+};
 
-svc.cancelByPlayer = (id, guildId, userId) =>
-  tx(async (c) => {
-    const m = await lockMatch(c, id, guildId);
-    if (!m) return { ok: false, reason: 'not_found' };
-    if (!seat(m, userId)) return { ok: false, reason: 'not_player' };
-    if (m.status !== 'confirming') return { ok: false, reason: 'bad_state' };
-    const row = (
-      await c.query(`UPDATE matches SET status='cancelled', finished_at=now() WHERE id=$1 RETURNING *`, [id])
-    ).rows[0];
-    await release(c, row);
-    return { ok: true, match: row };
-  });
+svc.confirm = (id, guildId, userId) => {
+  const m = getMatch(id, guildId);
+  if (!m) return { ok: false, reason: 'not_found' };
+  const s = seat(m, userId);
+  if (!s) return { ok: false, reason: 'not_player' };
+  if (m.status !== 'confirming') return { ok: false, reason: 'bad_state' };
+  if (s === 1) m.p1_confirmed = true;
+  else m.p2_confirmed = true;
+  if (m.p1_confirmed && m.p2_confirmed) m.status = 'active';
+  return { ok: true, match: m };
+};
 
-svc.cancelByAdmin = (id, guildId) =>
-  tx(async (c) => {
-    const m = await lockMatch(c, id, guildId);
-    if (!m) return { ok: false, reason: 'not_found' };
-    if (!OPEN.includes(m.status)) return { ok: false, reason: 'bad_state' };
-    const row = (
-      await c.query(`UPDATE matches SET status='cancelled', finished_at=now() WHERE id=$1 RETURNING *`, [id])
-    ).rows[0];
-    await release(c, row);
-    return { ok: true, match: row };
-  });
+svc.cancelByPlayer = (id, guildId, userId) => {
+  const m = getMatch(id, guildId);
+  if (!m) return { ok: false, reason: 'not_found' };
+  if (!seat(m, userId)) return { ok: false, reason: 'not_player' };
+  if (m.status !== 'confirming') return { ok: false, reason: 'bad_state' };
+  m.status = 'cancelled';
+  release(m);
+  return { ok: true, match: m };
+};
 
-svc.report = (id, guildId, userId, result) =>
-  tx(async (c) => {
-    const m = await lockMatch(c, id, guildId);
-    if (!m) return { ok: false, reason: 'not_found' };
-    const s = seat(m, userId);
-    if (!s) return { ok: false, reason: 'not_player' };
-    if (m.status !== 'active') return { ok: false, reason: 'bad_state' };
-    const col = s === 1 ? 'p1_report' : 'p2_report';
-    let row = (await c.query(`UPDATE matches SET ${col}=$2 WHERE id=$1 RETURNING *`, [id, result])).rows[0];
-    const r = resolveReports(row.p1_report, row.p2_report);
-    if (r.state === 'done') {
-      row = await finish(c, id, r.winner === 1 ? row.player1_id : row.player2_id);
-    } else if (r.state === 'disputed') {
-      row = (await c.query(`UPDATE matches SET status='disputed' WHERE id=$1 RETURNING *`, [id])).rows[0];
-    }
-    return { ok: true, match: row };
-  });
+svc.cancelByAdmin = (id, guildId) => {
+  const m = getMatch(id, guildId);
+  if (!m) return { ok: false, reason: 'not_found' };
+  if (!OPEN.includes(m.status)) return { ok: false, reason: 'bad_state' };
+  m.status = 'cancelled';
+  release(m);
+  return { ok: true, match: m };
+};
 
-svc.resolve = (id, guildId, winnerId) =>
-  tx(async (c) => {
-    const m = await lockMatch(c, id, guildId);
-    if (!m) return { ok: false, reason: 'not_found' };
-    if (!['active', 'disputed'].includes(m.status)) return { ok: false, reason: 'bad_state' };
-    if (!seat(m, winnerId)) return { ok: false, reason: 'not_player' };
-    return { ok: true, match: await finish(c, id, winnerId) };
-  });
+svc.report = (id, guildId, userId, result) => {
+  const m = getMatch(id, guildId);
+  if (!m) return { ok: false, reason: 'not_found' };
+  const s = seat(m, userId);
+  if (!s) return { ok: false, reason: 'not_player' };
+  if (m.status !== 'active') return { ok: false, reason: 'bad_state' };
+  if (s === 1) m.p1_report = result;
+  else m.p2_report = result;
+  const r = resolveReports(m.p1_report, m.p2_report);
+  if (r.state === 'done') finish(m, r.winner === 1 ? m.player1_id : m.player2_id);
+  else if (r.state === 'disputed') m.status = 'disputed';
+  return { ok: true, match: m };
+};
 
-svc.ranking = async (guildId, limit) =>
-  (
-    await pool.query(
-      `SELECT uid, SUM(w)::int AS wins, SUM(l)::int AS losses FROM (
-         SELECT winner_id AS uid, 1 AS w, 0 AS l FROM matches
-           WHERE guild_id=$1 AND status='finished' AND winner_id IS NOT NULL
-         UNION ALL
-         SELECT CASE WHEN winner_id=player1_id THEN player2_id ELSE player1_id END, 0, 1 FROM matches
-           WHERE guild_id=$1 AND status='finished' AND winner_id IS NOT NULL
-       ) t GROUP BY uid ORDER BY wins DESC, losses ASC, uid LIMIT $2`,
-      [guildId, limit],
+svc.resolve = (id, guildId, winnerId) => {
+  const m = getMatch(id, guildId);
+  if (!m) return { ok: false, reason: 'not_found' };
+  if (!['active', 'disputed'].includes(m.status)) return { ok: false, reason: 'bad_state' };
+  if (!seat(m, winnerId)) return { ok: false, reason: 'not_player' };
+  return { ok: true, match: finish(m, winnerId) };
+};
+
+svc.ranking = (guildId, limit) => {
+  const t = new Map();
+  const get = (uid) => {
+    if (!t.has(uid)) t.set(uid, { uid, wins: 0, losses: 0 });
+    return t.get(uid);
+  };
+  for (const m of matches.values()) {
+    if (m.guild_id !== guildId || m.status !== 'finished' || !m.winner_id) continue;
+    get(m.winner_id).wins++;
+    get(m.winner_id === m.player1_id ? m.player2_id : m.player1_id).losses++;
+  }
+  return [...t.values()]
+    .sort((a, b) => b.wins - a.wins || a.losses - b.losses || a.uid.localeCompare(b.uid))
+    .slice(0, limit);
+};
+
+svc.history = (guildId, userId) =>
+  [...matches.values()]
+    .filter(
+      (m) =>
+        m.guild_id === guildId &&
+        (m.player1_id === userId || m.player2_id === userId) &&
+        ['finished', 'cancelled'].includes(m.status),
     )
-  ).rows;
-
-svc.history = async (guildId, userId) =>
-  (
-    await pool.query(
-      `SELECT * FROM matches
-       WHERE guild_id=$1 AND (player1_id=$2 OR player2_id=$2) AND status IN ('finished','cancelled')
-       ORDER BY id DESC LIMIT 10`,
-      [guildId, userId],
-    )
-  ).rows;
+    .sort((a, b) => b.id - a.id)
+    .slice(0, 10);
 
 /* =====================================================================
    VISUAL (embeds e botões)
@@ -564,5 +463,123 @@ const NO_PING = { parse: [] };
 const NOT_ADMIN = 'Apenas administradores (permissão Gerenciar Servidor) podem usar este comando.';
 
 const REASONS = {
-  not_found: 'Esta fila/partida não existe mais.',
-  in_queue: 'Você já está em o
+  not_found: 'Esta fila/partida não existe mais. Peça a um admin para rodar /painel publicar.',
+  in_queue: 'Você já está em outra fila. Saia dela antes de entrar nesta.',
+  already_here: 'Você já está nesta fila.',
+  full: 'Esta fila já está com a partida completa.',
+  not_in_queue: 'Você não está nesta fila.',
+  in_match: 'Sua partida já foi formada. Use os botões da partida.',
+  not_player: 'Você não participa desta partida.',
+  bad_state: 'Esta ação não está mais disponível para esta partida.',
+};
+const why = (r) => REASONS[r.reason] || 'Não foi possível concluir a ação.';
+const isAdmin = (i) => Boolean(i.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
+
+async function editMessage(client, channelId, messageId, payload) {
+  if (!channelId || !messageId) return;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    const msg = await ch.messages.fetch(messageId);
+    await msg.edit(payload);
+  } catch (e) {
+    console.warn('Falha ao editar mensagem', messageId, e.code || e.message);
+  }
+}
+
+async function refreshQueue(client, queueId) {
+  const q = svc.getQueue(queueId);
+  if (!q) return;
+  await editMessage(client, q.channel_id, q.message_id, queueView(q, svc.getPlayers(q.id)));
+}
+
+const refreshMatch = (client, m) => editMessage(client, m.channel_id, m.message_id, matchView(m));
+
+async function afterMatchChange(client, m) {
+  await refreshMatch(client, m);
+  if (['finished', 'cancelled'].includes(m.status)) await refreshQueue(client, m.queue_id);
+}
+
+async function openMatch(client, m) {
+  const ch = await client.channels.fetch(m.channel_id);
+  const msg = await ch.send({
+    content: `<@${m.player1_id}> <@${m.player2_id}> — partida formada! Confirmem abaixo.`,
+    ...matchView(m),
+    allowedMentions: { users: [m.player1_id, m.player2_id] },
+  });
+  svc.setMatchMessage(m.id, msg.id);
+}
+
+async function removePanel(client, guildId) {
+  const list = svc.listQueues(guildId);
+  for (const q of list) {
+    try {
+      const ch = await client.channels.fetch(q.channel_id);
+      const msg = await ch.messages.fetch(q.message_id);
+      await msg.delete();
+    } catch {
+      /* mensagem já removida */
+    }
+  }
+  svc.deleteQueues(guildId);
+  return list.length;
+}
+
+async function handleButton(i, client) {
+  const [scope, action, idStr] = i.customId.split(':');
+  const id = Number(idStr);
+  if (!['q', 'm'].includes(scope) || !Number.isInteger(id) || !i.inGuild()) return;
+
+  await i.deferUpdate();
+  const say = (t) => i.followUp(eph(t));
+
+  if (scope === 'q') {
+    if (action === 'join') {
+      const r = svc.join(id, i.guildId, i.user.id);
+      if (!r.ok) return say(why(r));
+      await refreshQueue(client, id);
+      if (r.match) await openMatch(client, r.match);
+      return;
+    }
+    if (action === 'leave') {
+      const r = svc.leave(id, i.guildId, i.user.id);
+      if (!r.ok) return say(why(r));
+      return refreshQueue(client, id);
+    }
+    return;
+  }
+
+  const actions = {
+    confirm: () => svc.confirm(id, i.guildId, i.user.id),
+    cancel: () => svc.cancelByPlayer(id, i.guildId, i.user.id),
+    win: () => svc.report(id, i.guildId, i.user.id, 'win'),
+    loss: () => svc.report(id, i.guildId, i.user.id, 'loss'),
+  };
+  if (!actions[action]) return;
+  const r = actions[action]();
+  if (!r.ok) return say(why(r));
+  await afterMatchChange(client, r.match);
+  if ((action === 'win' || action === 'loss') && r.match.status === 'active') {
+    await say('✅ Resultado registrado. Aguardando o adversário reportar.');
+  }
+}
+
+async function cmdPainel(i, client) {
+  if (!isAdmin(i)) return i.reply(eph(NOT_ADMIN));
+  const sub = i.options.getSubcommand();
+
+  if (sub === 'publicar') {
+    const parsed = parseValues(i.options.getString('valores'));
+    if (!parsed.ok) {
+      return i.reply(
+        eph(`Valores inválidos: ${parsed.invalid.join(', ')}.\nPermitidos: ${ALLOWED_VALUES.join(', ')}`),
+      );
+    }
+    const perms = i.channel?.permissionsFor(i.guild.members.me);
+    const need = [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.AttachFiles,
+    ];
+    if (!perms?.has(need)) {
+      return i.reply(eph('Preciso das permissões Ver Canal, Enviar Mensagens, Inserir Links e
