@@ -1,325 +1,164 @@
 require('dotenv').config();
 const http = require('http');
 const zlib = require('zlib');
-const assert = require('assert');
-const {
-  Client,
-  GatewayIntentBits,
-  Events,
-  MessageFlags,
-  PermissionFlagsBits,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  AttachmentBuilder,
-  SlashCommandBuilder,
-} = require('discord.js');
+const { Client, GatewayIntentBits, Events, MessageFlags, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder, SlashCommandBuilder } = require('discord.js');
 
-/* =====================================================================
-   LÓGICA PURA
-===================================================================== */
-const ALLOWED_VALUES = [1, 2, 3, ...Array.from({ length: 20 }, (_, i) => (i + 1) * 5)];
-
-const PLATFORMS = {
-  mobile: { label: 'Mobile', emoji: '📱' },
-  emulador: { label: 'Emulador', emoji: '🖥️' },
-  unica: { label: 'Única', emoji: '⚽' },
-};
-
-const formatBRL = (v) => `R$ ${v}`;
-
-function parseValues(input) {
-  if (!input || !input.trim()) return { ok: true, values: [...ALLOWED_VALUES] };
-  const parts = input.split(/[,;\s]+/).filter(Boolean);
-  const nums = parts.map((p) => Number(p.replace(/^R\$/i, '')));
-  const invalid = parts.filter((_, i) => !ALLOWED_VALUES.includes(nums[i]));
-  if (invalid.length) return { ok: false, invalid };
-  return { ok: true, values: [...new Set(nums)].sort((a, b) => a - b) };
-}
-
-const platformsFor = (separate) => (separate ? ['mobile', 'emulador'] : ['unica']);
-
-function resolveReports(r1, r2) {
-  if (!r1 || !r2) return { state: 'pending' };
-  if (r1 === 'win' && r2 === 'loss') return { state: 'done', winner: 1 };
-  if (r1 === 'loss' && r2 === 'win') return { state: 'done', winner: 2 };
-  return { state: 'disputed' };
-}
-
-/* =====================================================================
-   LOGO (PNG quadrado preto e azul gerado pelo código)
-===================================================================== */
-const S = 256;
-const C_BLACK = [6, 10, 20];
-const C_NAVY = [10, 24, 56];
-const C_BLUE = [31, 111, 255];
-
-const CRC = (() => {
-  const t = [];
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (const b of buf) c = CRC[(c ^ b) & 255] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function pngChunk(type, data) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length);
-  const td = Buffer.concat([Buffer.from(type), data]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(td));
-  return Buffer.concat([len, td, crc]);
-}
-
-const pentagon = (r) =>
-  [...Array(5)].map((_, k) => {
-    const a = -Math.PI / 2 + (k * 2 * Math.PI) / 5;
-    return [S / 2 + r * Math.cos(a), S / 2 + r * Math.sin(a)];
-  });
-
-function inPoly(x, y, p) {
-  let inside = false;
-  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
-    const [xi, yi] = p[i];
-    const [xj, yj] = p[j];
-    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
-  }
-  return inside;
-}
-
-function distSeg(x, y, [ax, ay], [bx, by]) {
-  const dx = bx - ax;
-  const dy = by - ay;
-  const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)));
-  return Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
-}
-
-let logoCache;
-function logoPng() {
-  if (logoCache) return logoCache;
-  const inner = pentagon(34);
-  const outer = pentagon(96);
-  const raw = Buffer.alloc((S * 4 + 1) * S);
-  for (let y = 0; y < S; y++) {
-    raw[y * (S * 4 + 1)] = 0;
-    for (let x = 0; x < S; x++) {
-      let c = C_BLACK;
-      const d = Math.hypot(x - S / 2, y - S / 2);
-      if (d < 91) c = C_NAVY;
-      if (Math.abs(d - 96) < 5) c = C_BLUE;
-      if (inPoly(x, y, inner)) c = C_BLUE;
-      for (let k = 0; k < 5; k++) if (distSeg(x, y, inner[k], outer[k]) < 3) c = C_BLUE;
-      if (x < 8 || y < 8 || x >= S - 8 || y >= S - 8) c = C_BLUE;
-      const i = y * (S * 4 + 1) + 1 + x * 4;
-      raw[i] = c[0];
-      raw[i + 1] = c[1];
-      raw[i + 2] = c[2];
-      raw[i + 3] = 255;
-    }
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(S, 0);
-  ihdr.writeUInt32BE(S, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
-  logoCache = Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', zlib.deflateSync(raw)),
-    pngChunk('IEND', Buffer.alloc(0)),
-  ]);
-  return logoCache;
-}
-
-/* =====================================================================
-   ESTADO EM MEMÓRIA (zera quando o bot reinicia)
-===================================================================== */
+const VALUES = [1, 2, 3, ...Array.from({ length: 20 }, (_, i) => (i + 1) * 5)];
+const PLAT = { mobile: '📱 Mobile', emulador: '🖥️ Emulador' };
+const BLUE = 0x1f6fff;
 const OPEN = ['confirming', 'active', 'disputed'];
+const P = ButtonStyle.Primary;
+const G = ButtonStyle.Secondary;
+
+function parseValues(s) {
+  if (!s || !s.trim()) return { ok: true, values: [...VALUES] };
+  const parts = s.split(/[,;\s]+/).filter(Boolean);
+  const nums = parts.map((p) => Number(p.replace(/^R\$/i, '')));
+  const invalid = parts.filter((_, i) => !VALUES.includes(nums[i]));
+  return invalid.length ? { ok: false, invalid } : { ok: true, values: [...new Set(nums)].sort((a, b) => a - b) };
+}
+
+/* ---------- logo PNG preto e azul gerado pelo código ---------- */
+let logo;
+function logoPng() {
+  if (logo) return logo;
+  const S = 256;
+  const K = [[6, 10, 20], [10, 24, 56], [31, 111, 255]];
+  const pent = (r) => [0, 1, 2, 3, 4].map((k) => { const a = -Math.PI / 2 + (k * 2 * Math.PI) / 5; return [128 + r * Math.cos(a), 128 + r * Math.sin(a)]; });
+  const A = pent(34);
+  const B = pent(96);
+  const inPoly = (x, y) => { let o = false; for (let i = 0, j = 4; i < 5; j = i++) { const [xi, yi] = A[i]; const [xj, yj] = A[j]; if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) o = !o; } return o; };
+  const seg = (x, y, [ax, ay], [bx, by]) => { const dx = bx - ax; const dy = by - ay; const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy))); return Math.hypot(x - ax - t * dx, y - ay - t * dy); };
+  const raw = Buffer.alloc((S * 4 + 1) * S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const d = Math.hypot(x - 128, y - 128);
+    let c = K[0];
+    if (d < 91) c = K[1];
+    if (Math.abs(d - 96) < 5 || inPoly(x, y) || x < 8 || y < 8 || x >= 248 || y >= 248 || A.some((p, k) => seg(x, y, p, B[k]) < 3)) c = K[2];
+    const i = y * (S * 4 + 1) + 1 + x * 4;
+    raw[i] = c[0]; raw[i + 1] = c[1]; raw[i + 2] = c[2]; raw[i + 3] = 255;
+  }
+  const T = [];
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; T[n] = c >>> 0; }
+  const chunk = (type, data) => {
+    const td = Buffer.concat([Buffer.from(type), data]);
+    let c = 0xffffffff;
+    for (const b of td) c = T[(c ^ b) & 255] ^ (c >>> 8);
+    const h = Buffer.alloc(4);
+    const e = Buffer.alloc(4);
+    h.writeUInt32BE(data.length);
+    e.writeUInt32BE((c ^ 0xffffffff) >>> 0);
+    return Buffer.concat([h, td, e]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(S, 0); ihdr.writeUInt32BE(S, 4); ihdr[8] = 8; ihdr[9] = 6;
+  logo = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+  return logo;
+}
+
+/* ---------- estado em memória (zera ao reiniciar) ---------- */
 const queues = new Map();
 const matches = new Map();
-let nextQueueId = 1;
-let nextMatchId = 1;
+let qSeq = 1;
+let mSeq = 1;
+const seat = (m, u) => (m.p1 === u ? 1 : m.p2 === u ? 2 : 0);
+const qList = (g) => [...queues.values()].filter((q) => q.guild === g);
+const mGet = (id, g) => { const m = matches.get(id); return m && m.guild === g ? m : null; };
+const openCount = (g) => [...matches.values()].filter((m) => m.guild === g && OPEN.includes(m.status)).length;
+const end = (m, status, winner = null) => { m.status = status; m.winner = winner; const q = queues.get(m.queue); if (q) q.players = []; return m; };
 
-const seat = (m, uid) => (m.player1_id === uid ? 1 : m.player2_id === uid ? 2 : 0);
-const getMatch = (id, guildId) => {
-  const m = matches.get(id);
-  return m && m.guild_id === guildId ? m : null;
-};
-const release = (m) => {
-  const q = queues.get(m.queue_id);
-  if (q) q.players = [];
-};
-const finish = (m, winnerId) => {
-  m.status = 'finished';
-  m.winner_id = winnerId;
-  release(m);
-  return m;
-};
-
-const svc = {};
-
-svc.reset = () => {
-  queues.clear();
-  matches.clear();
-  nextQueueId = 1;
-  nextMatchId = 1;
-};
-
-svc.createQueue = (guildId, channelId, platform, value) => {
-  const q = { id: nextQueueId++, guild_id: guildId, channel_id: channelId, message_id: null, platform, value, players: [] };
+function newQueue(guild, channel, platform, value) {
+  const q = { id: qSeq++, guild, channel, msg: null, platform, value, players: [] };
   queues.set(q.id, q);
   return q;
-};
-svc.setQueueMessage = (id, messageId) => {
+}
+
+function join(id, g, u) {
   const q = queues.get(id);
-  if (q) q.message_id = messageId;
-};
-svc.getQueue = (id) => queues.get(id) || null;
-svc.listQueues = (guildId) => [...queues.values()].filter((q) => q.guild_id === guildId);
-svc.deleteQueues = (guildId) => svc.listQueues(guildId).forEach((q) => queues.delete(q.id));
-svc.getPlayers = (id) => [...(queues.get(id)?.players || [])];
-svc.openMatchCount = (guildId) =>
-  [...matches.values()].filter((m) => m.guild_id === guildId && OPEN.includes(m.status)).length;
-svc.setMatchMessage = (id, messageId) => {
-  const m = matches.get(id);
-  if (m) m.message_id = messageId;
-};
+  if (!q || q.guild !== g) return { err: 'nf' };
+  const cur = qList(g).find((x) => x.players.includes(u));
+  if (cur) return { err: cur.id === q.id ? 'here' : 'busy' };
+  if (q.players.length >= 2) return { err: 'full' };
+  q.players.push(u);
+  if (q.players.length < 2) return {};
+  const m = { id: mSeq++, guild: g, queue: q.id, channel: q.channel, msg: null, platform: q.platform, value: q.value, p1: q.players[0], p2: q.players[1], c1: false, c2: false, r1: null, r2: null, status: 'confirming', winner: null };
+  matches.set(m.id, m);
+  return { match: m };
+}
 
-svc.join = (queueId, guildId, userId) => {
-  const q = queues.get(queueId);
-  if (!q || q.guild_id !== guildId) return { ok: false, reason: 'not_found' };
-  const cur = svc.listQueues(guildId).find((x) => x.players.includes(userId));
-  if (cur) return { ok: false, reason: cur.id === q.id ? 'already_here' : 'in_queue' };
-  if (q.players.length >= 2) return { ok: false, reason: 'full' };
-  q.players.push(userId);
-  let match = null;
-  if (q.players.length === 2) {
-    match = {
-      id: nextMatchId++,
-      guild_id: guildId,
-      queue_id: q.id,
-      channel_id: q.channel_id,
-      message_id: null,
-      platform: q.platform,
-      value: q.value,
-      player1_id: q.players[0],
-      player2_id: q.players[1],
-      p1_confirmed: false,
-      p2_confirmed: false,
-      p1_report: null,
-      p2_report: null,
-      status: 'confirming',
-      winner_id: null,
-    };
-    matches.set(match.id, match);
+function leave(id, g, u) {
+  const q = queues.get(id);
+  if (!q || q.guild !== g) return { err: 'nf' };
+  if (!q.players.includes(u)) return { err: 'notin' };
+  if (q.players.length >= 2) return { err: 'inmatch' };
+  q.players = q.players.filter((p) => p !== u);
+  return {};
+}
+
+function confirm(id, g, u) {
+  const m = mGet(id, g);
+  if (!m) return { err: 'nf' };
+  const s = seat(m, u);
+  if (!s) return { err: 'notplayer' };
+  if (m.status !== 'confirming') return { err: 'state' };
+  m['c' + s] = true;
+  if (m.c1 && m.c2) m.status = 'active';
+  return { match: m };
+}
+
+function cancel(id, g, u, admin) {
+  const m = mGet(id, g);
+  if (!m) return { err: 'nf' };
+  if (!admin && !seat(m, u)) return { err: 'notplayer' };
+  if (!admin && m.status !== 'confirming') return { err: 'state' };
+  if (!OPEN.includes(m.status)) return { err: 'state' };
+  return { match: end(m, 'cancelled') };
+}
+
+function report(id, g, u, res) {
+  const m = mGet(id, g);
+  if (!m) return { err: 'nf' };
+  const s = seat(m, u);
+  if (!s) return { err: 'notplayer' };
+  if (m.status !== 'active') return { err: 'state' };
+  m['r' + s] = res;
+  if (m.r1 && m.r2) {
+    if (m.r1 !== m.r2) end(m, 'finished', m.r1 === 'win' ? m.p1 : m.p2);
+    else m.status = 'disputed';
   }
-  return { ok: true, queue: q, match };
-};
+  return { match: m };
+}
 
-svc.leave = (queueId, guildId, userId) => {
-  const q = queues.get(queueId);
-  if (!q || q.guild_id !== guildId) return { ok: false, reason: 'not_found' };
-  if (!q.players.includes(userId)) return { ok: false, reason: 'not_in_queue' };
-  if (q.players.length >= 2) return { ok: false, reason: 'in_match' };
-  q.players = q.players.filter((p) => p !== userId);
-  return { ok: true };
-};
+function resolve(id, g, w) {
+  const m = mGet(id, g);
+  if (!m) return { err: 'nf' };
+  if (!['active', 'disputed'].includes(m.status)) return { err: 'state' };
+  if (!seat(m, w)) return { err: 'notplayer' };
+  return { match: end(m, 'finished', w) };
+}
 
-svc.confirm = (id, guildId, userId) => {
-  const m = getMatch(id, guildId);
-  if (!m) return { ok: false, reason: 'not_found' };
-  const s = seat(m, userId);
-  if (!s) return { ok: false, reason: 'not_player' };
-  if (m.status !== 'confirming') return { ok: false, reason: 'bad_state' };
-  if (s === 1) m.p1_confirmed = true;
-  else m.p2_confirmed = true;
-  if (m.p1_confirmed && m.p2_confirmed) m.status = 'active';
-  return { ok: true, match: m };
-};
-
-svc.cancelByPlayer = (id, guildId, userId) => {
-  const m = getMatch(id, guildId);
-  if (!m) return { ok: false, reason: 'not_found' };
-  if (!seat(m, userId)) return { ok: false, reason: 'not_player' };
-  if (m.status !== 'confirming') return { ok: false, reason: 'bad_state' };
-  m.status = 'cancelled';
-  release(m);
-  return { ok: true, match: m };
-};
-
-svc.cancelByAdmin = (id, guildId) => {
-  const m = getMatch(id, guildId);
-  if (!m) return { ok: false, reason: 'not_found' };
-  if (!OPEN.includes(m.status)) return { ok: false, reason: 'bad_state' };
-  m.status = 'cancelled';
-  release(m);
-  return { ok: true, match: m };
-};
-
-svc.report = (id, guildId, userId, result) => {
-  const m = getMatch(id, guildId);
-  if (!m) return { ok: false, reason: 'not_found' };
-  const s = seat(m, userId);
-  if (!s) return { ok: false, reason: 'not_player' };
-  if (m.status !== 'active') return { ok: false, reason: 'bad_state' };
-  if (s === 1) m.p1_report = result;
-  else m.p2_report = result;
-  const r = resolveReports(m.p1_report, m.p2_report);
-  if (r.state === 'done') finish(m, r.winner === 1 ? m.player1_id : m.player2_id);
-  else if (r.state === 'disputed') m.status = 'disputed';
-  return { ok: true, match: m };
-};
-
-svc.resolve = (id, guildId, winnerId) => {
-  const m = getMatch(id, guildId);
-  if (!m) return { ok: false, reason: 'not_found' };
-  if (!['active', 'disputed'].includes(m.status)) return { ok: false, reason: 'bad_state' };
-  if (!seat(m, winnerId)) return { ok: false, reason: 'not_player' };
-  return { ok: true, match: finish(m, winnerId) };
-};
-
-svc.ranking = (guildId, limit) => {
+function ranking(g, limit) {
   const t = new Map();
-  const get = (uid) => {
-    if (!t.has(uid)) t.set(uid, { uid, wins: 0, losses: 0 });
-    return t.get(uid);
-  };
+  const rec = (u) => t.get(u) || t.set(u, { uid: u, wins: 0, losses: 0 }).get(u);
   for (const m of matches.values()) {
-    if (m.guild_id !== guildId || m.status !== 'finished' || !m.winner_id) continue;
-    get(m.winner_id).wins++;
-    get(m.winner_id === m.player1_id ? m.player2_id : m.player1_id).losses++;
+    if (m.guild !== g || m.status !== 'finished') continue;
+    rec(m.winner).wins++;
+    rec(m.winner === m.p1 ? m.p2 : m.p1).losses++;
   }
-  return [...t.values()]
-    .sort((a, b) => b.wins - a.wins || a.losses - b.losses || a.uid.localeCompare(b.uid))
-    .slice(0, limit);
+  return [...t.values()].sort((a, b) => b.wins - a.wins || a.losses - b.losses || a.uid.localeCompare(b.uid)).slice(0, limit);
+}
+
+/* ---------- visual ---------- */
+const ERR = {
+  nf: 'Esta fila/partida não existe mais. Peça a um admin para rodar /painel publicar.',
+  busy: 'Você já está em outra fila. Saia dela antes de entrar nesta.',
+  here: 'Você já está nesta fila.',
+  full: 'Esta fila já está com a partida completa.',
+  notin: 'Você não está nesta fila.',
+  inmatch: 'Sua partida já foi formada. Use os botões da partida.',
+  notplayer: 'Você não participa desta partida.',
+  state: 'Esta ação não está mais disponível para esta partida.',
 };
-
-svc.history = (guildId, userId) =>
-  [...matches.values()]
-    .filter(
-      (m) =>
-        m.guild_id === guildId &&
-        (m.player1_id === userId || m.player2_id === userId) &&
-        ['finished', 'cancelled'].includes(m.status),
-    )
-    .sort((a, b) => b.id - a.id)
-    .slice(0, 10);
-
-/* =====================================================================
-   VISUAL (embeds e botões)
-===================================================================== */
-const BLUE = 0x1f6fff;
-const logoFile = () => new AttachmentBuilder(logoPng(), { name: 'logo.png' });
-
 const STATUS = {
   confirming: '⏳ Aguardando confirmação dos jogadores',
   active: '🎮 Em andamento — reportem o resultado',
@@ -327,259 +166,239 @@ const STATUS = {
   finished: '🏁 Finalizada',
   cancelled: '❌ Cancelada',
 };
+const file = () => new AttachmentBuilder(logoPng(), { name: 'logo.png' });
+const btn = (id, label, style, off = false) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(off);
+const row = (...b) => new ActionRowBuilder().addComponents(...b);
+const fields = (x) => [
+  { name: 'Formato', value: 'X1', inline: true },
+  { name: 'Valor', value: `R$ ${x.value}`, inline: true },
+  ...(PLAT[x.platform] ? [{ name: 'Plataforma', value: PLAT[x.platform], inline: true }] : []),
+];
 
-function baseFields(item) {
-  const f = [
-    { name: 'Formato', value: 'X1', inline: true },
-    { name: 'Valor', value: formatBRL(item.value), inline: true },
-  ];
-  if (item.platform !== 'unica') {
-    const p = PLATFORMS[item.platform];
-    f.push({ name: 'Plataforma', value: `${p.emoji} ${p.label}`, inline: true });
-  }
-  return f;
-}
-
-function queueView(queue, players) {
-  const full = players.length >= 2;
-  const embed = new EmbedBuilder()
-    .setColor(BLUE)
-    .setTitle('Filas eFootball')
-    .setThumbnail('attachment://logo.png')
-    .addFields(
-      ...baseFields(queue),
-      { name: 'Jogadores', value: players.length ? players.map((id) => `<@${id}>`).join('\n') : '—' },
-      { name: 'Status', value: full ? '🟢 Partida completa' : `🟡 Aguardando jogador (${players.length}/2)` },
-    )
+function queueView(q) {
+  const full = q.players.length >= 2;
+  const e = new EmbedBuilder().setColor(BLUE).setTitle('Filas eFootball').setThumbnail('attachment://logo.png')
+    .addFields(...fields(q),
+      { name: 'Jogadores', value: q.players.length ? q.players.map((u) => `<@${u}>`).join('\n') : '—' },
+      { name: 'Status', value: full ? '🟢 Partida completa' : `🟡 Aguardando jogador (${q.players.length}/2)` })
     .setFooter({ text: 'eFootball • X1' });
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`q:join:${queue.id}`)
-      .setLabel('Entrar na fila')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(full),
-    new ButtonBuilder()
-      .setCustomId(`q:leave:${queue.id}`)
-      .setLabel('Sair da fila')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(full),
-  );
-  return { embeds: [embed], components: [row], files: [logoFile()] };
+  return { embeds: [e], components: [row(btn(`q:join:${q.id}`, 'Entrar na fila', P, full), btn(`q:leave:${q.id}`, 'Sair da fila', G, full))], files: [file()] };
 }
 
 function matchView(m) {
-  const mark = (ok) => (m.status === 'confirming' ? (ok ? ' ✅' : ' ⏳') : '');
-  const fields = [
-    ...baseFields(m),
-    { name: 'Jogadores', value: `<@${m.player1_id}>${mark(m.p1_confirmed)}\n<@${m.player2_id}>${mark(m.p2_confirmed)}` },
-    { name: 'Status', value: STATUS[m.status] },
-  ];
-  if (m.winner_id) fields.push({ name: 'Vencedor', value: `🏆 <@${m.winner_id}>` });
-
-  const embed = new EmbedBuilder()
-    .setColor(BLUE)
-    .setTitle(`Partida #${m.id} • X1`)
-    .setThumbnail('attachment://logo.png')
-    .addFields(fields)
-    .setFooter({ text: 'eFootball • X1' });
-
-  const btn = (id, label, style) =>
-    new ButtonBuilder().setCustomId(`m:${id}:${m.id}`).setLabel(label).setStyle(style);
-
-  let components = [];
-  if (m.status === 'confirming') {
-    components = [
-      new ActionRowBuilder().addComponents(
-        btn('confirm', 'Confirmar', ButtonStyle.Primary),
-        btn('cancel', 'Cancelar', ButtonStyle.Secondary),
-      ),
-    ];
-  } else if (m.status === 'active') {
-    components = [
-      new ActionRowBuilder().addComponents(
-        btn('win', 'Venci', ButtonStyle.Primary),
-        btn('loss', 'Perdi', ButtonStyle.Secondary),
-      ),
-    ];
-  }
-  return { embeds: [embed], components, files: [logoFile()] };
+  const mk = (ok) => (m.status === 'confirming' ? (ok ? ' ✅' : ' ⏳') : '');
+  const f = [...fields(m), { name: 'Jogadores', value: `<@${m.p1}>${mk(m.c1)}\n<@${m.p2}>${mk(m.c2)}` }, { name: 'Status', value: STATUS[m.status] }];
+  if (m.winner) f.push({ name: 'Vencedor', value: `🏆 <@${m.winner}>` });
+  const e = new EmbedBuilder().setColor(BLUE).setTitle(`Partida #${m.id} • X1`).setThumbnail('attachment://logo.png').addFields(f).setFooter({ text: 'eFootball • X1' });
+  const b = (a, l, s) => btn(`m:${a}:${m.id}`, l, s);
+  const components = m.status === 'confirming' ? [row(b('confirm', 'Confirmar', P), b('cancel', 'Cancelar', G))]
+    : m.status === 'active' ? [row(b('win', 'Venci', P), b('loss', 'Perdi', G))] : [];
+  return { embeds: [e], components, files: [file()] };
 }
 
-/* =====================================================================
-   COMANDOS SLASH
-===================================================================== */
-const commandDefs = [
-  new SlashCommandBuilder()
-    .setName('painel')
-    .setDescription('Gerencia o painel de filas (admin)')
-    .addSubcommand((s) =>
-      s
-        .setName('publicar')
-        .setDescription('Publica as filas neste canal')
-        .addStringOption((o) => o.setName('valores').setDescription('Ex: 1,2,5,10 (vazio = todos)'))
-        .addBooleanOption((o) =>
-          o.setName('separar_plataformas').setDescription('Separar Mobile e Emulador (padrão: sim)'),
-        ),
-    )
+/* ---------- comandos slash ---------- */
+const commands = [
+  new SlashCommandBuilder().setName('painel').setDescription('Gerencia o painel de filas (admin)')
+    .addSubcommand((s) => s.setName('publicar').setDescription('Publica as filas neste canal')
+      .addStringOption((o) => o.setName('valores').setDescription('Ex: 1,2,5,10 (vazio = todos)'))
+      .addBooleanOption((o) => o.setName('separar_plataformas').setDescription('Separar Mobile e Emulador (padrão: sim)')))
     .addSubcommand((s) => s.setName('atualizar').setDescription('Reatualiza os embeds das filas'))
     .addSubcommand((s) => s.setName('remover').setDescription('Remove o painel de filas')),
-
-  new SlashCommandBuilder()
-    .setName('ranking')
-    .setDescription('Ranking de vitórias')
-    .addIntegerOption((o) =>
-      o.setName('limite').setDescription('Quantidade (1-25)').setMinValue(1).setMaxValue(25),
-    ),
-
-  new SlashCommandBuilder()
-    .setName('historico')
-    .setDescription('Histórico das últimas partidas')
+  new SlashCommandBuilder().setName('ranking').setDescription('Ranking de vitórias')
+    .addIntegerOption((o) => o.setName('limite').setDescription('Quantidade (1-25)').setMinValue(1).setMaxValue(25)),
+  new SlashCommandBuilder().setName('historico').setDescription('Histórico das últimas partidas')
     .addUserOption((o) => o.setName('jogador').setDescription('Jogador (padrão: você)')),
-
-  new SlashCommandBuilder()
-    .setName('partida')
-    .setDescription('Ações de administrador em partidas')
-    .addSubcommand((s) =>
-      s
-        .setName('resolver')
-        .setDescription('Define o vencedor de uma partida')
-        .addIntegerOption((o) => o.setName('id').setDescription('ID da partida').setRequired(true))
-        .addUserOption((o) => o.setName('vencedor').setDescription('Vencedor').setRequired(true)),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('cancelar')
-        .setDescription('Cancela uma partida')
-        .addIntegerOption((o) => o.setName('id').setDescription('ID da partida').setRequired(true)),
-    ),
+  new SlashCommandBuilder().setName('partida').setDescription('Ações de administrador em partidas')
+    .addSubcommand((s) => s.setName('resolver').setDescription('Define o vencedor de uma partida')
+      .addIntegerOption((o) => o.setName('id').setDescription('ID da partida').setRequired(true))
+      .addUserOption((o) => o.setName('vencedor').setDescription('Vencedor').setRequired(true)))
+    .addSubcommand((s) => s.setName('cancelar').setDescription('Cancela uma partida')
+      .addIntegerOption((o) => o.setName('id').setDescription('ID da partida').setRequired(true))),
 ].map((c) => c.toJSON());
 
-/* =====================================================================
-   HANDLERS
-===================================================================== */
+/* ---------- handlers ---------- */
 const eph = (content) => ({ content, flags: MessageFlags.Ephemeral });
-const NO_PING = { parse: [] };
-const NOT_ADMIN = 'Apenas administradores (permissão Gerenciar Servidor) podem usar este comando.';
-
-const REASONS = {
-  not_found: 'Esta fila/partida não existe mais. Peça a um admin para rodar /painel publicar.',
-  in_queue: 'Você já está em outra fila. Saia dela antes de entrar nesta.',
-  already_here: 'Você já está nesta fila.',
-  full: 'Esta fila já está com a partida completa.',
-  not_in_queue: 'Você não está nesta fila.',
-  in_match: 'Sua partida já foi formada. Use os botões da partida.',
-  not_player: 'Você não participa desta partida.',
-  bad_state: 'Esta ação não está mais disponível para esta partida.',
-};
-const why = (r) => REASONS[r.reason] || 'Não foi possível concluir a ação.';
 const isAdmin = (i) => Boolean(i.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
 
-async function editMessage(client, channelId, messageId, payload) {
-  if (!channelId || !messageId) return;
-  try {
-    const ch = await client.channels.fetch(channelId);
-    const msg = await ch.messages.fetch(messageId);
-    await msg.edit(payload);
-  } catch (e) {
-    console.warn('Falha ao editar mensagem', messageId, e.code || e.message);
-  }
+async function edit(client, channel, msg, payload) {
+  if (!msg) return;
+  try { const m = await (await client.channels.fetch(channel)).messages.fetch(msg); await m.edit(payload); }
+  catch (e) { console.warn('Falha ao editar mensagem:', e.code || e.message); }
 }
-
-async function refreshQueue(client, queueId) {
-  const q = svc.getQueue(queueId);
-  if (!q) return;
-  await editMessage(client, q.channel_id, q.message_id, queueView(q, svc.getPlayers(q.id)));
+const refreshQ = (c, q) => (q ? edit(c, q.channel, q.msg, queueView(q)) : null);
+async function refreshM(c, m) {
+  await edit(c, m.channel, m.msg, matchView(m));
+  if (['finished', 'cancelled'].includes(m.status)) await refreshQ(c, queues.get(m.queue));
 }
-
-const refreshMatch = (client, m) => editMessage(client, m.channel_id, m.message_id, matchView(m));
-
-async function afterMatchChange(client, m) {
-  await refreshMatch(client, m);
-  if (['finished', 'cancelled'].includes(m.status)) await refreshQueue(client, m.queue_id);
+async function openMatch(c, m) {
+  const ch = await c.channels.fetch(m.channel);
+  const sent = await ch.send({ content: `<@${m.p1}> <@${m.p2}> — partida formada! Confirmem abaixo.`, ...matchView(m), allowedMentions: { users: [m.p1, m.p2] } });
+  m.msg = sent.id;
 }
-
-async function openMatch(client, m) {
-  const ch = await client.channels.fetch(m.channel_id);
-  const msg = await ch.send({
-    content: `<@${m.player1_id}> <@${m.player2_id}> — partida formada! Confirmem abaixo.`,
-    ...matchView(m),
-    allowedMentions: { users: [m.player1_id, m.player2_id] },
-  });
-  svc.setMatchMessage(m.id, msg.id);
-}
-
-async function removePanel(client, guildId) {
-  const list = svc.listQueues(guildId);
+async function removePanel(c, g) {
+  const list = qList(g);
   for (const q of list) {
-    try {
-      const ch = await client.channels.fetch(q.channel_id);
-      const msg = await ch.messages.fetch(q.message_id);
-      await msg.delete();
-    } catch {
-      /* mensagem já removida */
-    }
+    try { await (await (await c.channels.fetch(q.channel)).messages.fetch(q.msg)).delete(); } catch { /* já removida */ }
   }
-  svc.deleteQueues(guildId);
+  list.forEach((q) => queues.delete(q.id));
   return list.length;
 }
 
-async function handleButton(i, client) {
-  const [scope, action, idStr] = i.customId.split(':');
-  const id = Number(idStr);
+async function onButton(i, c) {
+  const [scope, action, raw] = i.customId.split(':');
+  const id = Number(raw);
   if (!['q', 'm'].includes(scope) || !Number.isInteger(id) || !i.inGuild()) return;
-
   await i.deferUpdate();
   const say = (t) => i.followUp(eph(t));
-
+  const u = i.user.id;
+  const g = i.guildId;
+  let r;
   if (scope === 'q') {
-    if (action === 'join') {
-      const r = svc.join(id, i.guildId, i.user.id);
-      if (!r.ok) return say(why(r));
-      await refreshQueue(client, id);
-      if (r.match) await openMatch(client, r.match);
-      return;
-    }
-    if (action === 'leave') {
-      const r = svc.leave(id, i.guildId, i.user.id);
-      if (!r.ok) return say(why(r));
-      return refreshQueue(client, id);
-    }
+    if (action === 'join') r = join(id, g, u);
+    else if (action === 'leave') r = leave(id, g, u);
+    else return;
+    if (r.err) return say(ERR[r.err]);
+    await refreshQ(c, queues.get(id));
+    if (r.match) await openMatch(c, r.match);
     return;
   }
-
-  const actions = {
-    confirm: () => svc.confirm(id, i.guildId, i.user.id),
-    cancel: () => svc.cancelByPlayer(id, i.guildId, i.user.id),
-    win: () => svc.report(id, i.guildId, i.user.id, 'win'),
-    loss: () => svc.report(id, i.guildId, i.user.id, 'loss'),
-  };
-  if (!actions[action]) return;
-  const r = actions[action]();
-  if (!r.ok) return say(why(r));
-  await afterMatchChange(client, r.match);
-  if ((action === 'win' || action === 'loss') && r.match.status === 'active') {
-    await say('✅ Resultado registrado. Aguardando o adversário reportar.');
-  }
+  if (action === 'confirm') r = confirm(id, g, u);
+  else if (action === 'cancel') r = cancel(id, g, u, false);
+  else if (action === 'win' || action === 'loss') r = report(id, g, u, action);
+  else return;
+  if (r.err) return say(ERR[r.err]);
+  await refreshM(c, r.match);
+  if (r.match.status === 'active' && (action === 'win' || action === 'loss')) await say('✅ Resultado registrado. Aguardando o adversário reportar.');
 }
 
-async function cmdPainel(i, client) {
-  if (!isAdmin(i)) return i.reply(eph(NOT_ADMIN));
+async function cmdPainel(i, c) {
   const sub = i.options.getSubcommand();
-
+  const g = i.guildId;
   if (sub === 'publicar') {
     const parsed = parseValues(i.options.getString('valores'));
-    if (!parsed.ok) {
-      return i.reply(
-        eph(`Valores inválidos: ${parsed.invalid.join(', ')}.\nPermitidos: ${ALLOWED_VALUES.join(', ')}`),
-      );
-    }
+    if (!parsed.ok) return i.reply(eph(`Valores inválidos: ${parsed.invalid.join(', ')}.\nPermitidos: ${VALUES.join(', ')}`));
     const perms = i.channel?.permissionsFor(i.guild.members.me);
-    const need = [
-      PermissionFlagsBits.ViewChannel,
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.EmbedLinks,
-      PermissionFlagsBits.AttachFiles,
-    ];
-    if (!perms?.has(need)) {
-      return i.reply(eph('Preciso das permissões Ver Canal, Enviar Mensagens, Inserir Links e
+    const need = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles];
+    if (!perms?.has(need)) return i.reply(eph('Preciso das permissões Ver Canal, Enviar Mensagens, Inserir Links e Anexar Arquivos neste canal.'));
+    if (openCount(g)) return i.reply(eph('Há partidas em andamento. Finalize ou cancele-as antes de republicar o painel.'));
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    await removePanel(c, g);
+    const plats = (i.options.getBoolean('separar_plataformas') ?? true) ? ['mobile', 'emulador'] : ['unica'];
+    let n = 0;
+    for (const platform of plats) {
+      for (const value of parsed.values) {
+        const q = newQueue(g, i.channelId, platform, value);
+        q.msg = (await i.channel.send(queueView(q))).id;
+        n++;
+      }
+    }
+    return i.editReply(`✅ Painel publicado com ${n} filas.`);
+  }
+  if (sub === 'atualizar') {
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const list = qList(g);
+    for (const q of list) await refreshQ(c, q);
+    return i.editReply(`✅ ${list.length} filas atualizadas.`);
+  }
+  if (openCount(g)) return i.reply(eph('Há partidas em andamento. Finalize ou cancele-as antes de remover o painel.'));
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  return i.editReply(`🗑️ ${await removePanel(c, g)} filas removidas.`);
+}
+
+function cmdRanking(i) {
+  const rows = ranking(i.guildId, i.options.getInteger('limite') ?? 10);
+  const medals = ['🥇', '🥈', '🥉'];
+  const desc = rows.length ? rows.map((r, k) => `${medals[k] || `**${k + 1}.**`} <@${r.uid}> — ${r.wins}V • ${r.losses}D`).join('\n') : 'Ainda não há partidas finalizadas.';
+  const e = new EmbedBuilder().setColor(BLUE).setTitle('🏆 Ranking eFootball • X1').setDescription(desc);
+  return i.reply({ embeds: [e], allowedMentions: { parse: [] } });
+}
+
+function cmdHistorico(i) {
+  const user = i.options.getUser('jogador') ?? i.user;
+  const rows = [...matches.values()]
+    .filter((m) => m.guild === i.guildId && (m.p1 === user.id || m.p2 === user.id) && ['finished', 'cancelled'].includes(m.status))
+    .sort((a, b) => b.id - a.id).slice(0, 10);
+  const desc = rows.length ? rows.map((m) => {
+    const opp = m.p1 === user.id ? m.p2 : m.p1;
+    const res = m.status === 'cancelled' ? '❌ Cancelada' : m.winner === user.id ? '🏆 Vitória' : '💀 Derrota';
+    return `#${m.id} • R$ ${m.value} • ${PLAT[m.platform] || 'eFootball'} • vs <@${opp}> — ${res}`;
+  }).join('\n') : 'Nenhuma partida encontrada.';
+  const e = new EmbedBuilder().setColor(BLUE).setTitle(`📜 Histórico • ${user.username}`).setDescription(desc);
+  return i.reply({ embeds: [e], allowedMentions: { parse: [] }, flags: MessageFlags.Ephemeral });
+}
+
+async function cmdPartida(i, c) {
+  const id = i.options.getInteger('id', true);
+  const resolving = i.options.getSubcommand() === 'resolver';
+  const r = resolving ? resolve(id, i.guildId, i.options.getUser('vencedor', true).id) : cancel(id, i.guildId, null, true);
+  if (r.err) return i.reply(eph(ERR[r.err]));
+  await refreshM(c, r.match);
+  return i.reply(eph(`✅ Partida #${id} ${resolving ? 'finalizada' : 'cancelada'}.`));
+}
+
+async function onCommand(i, c) {
+  if (!i.inGuild()) return i.reply(eph('Use este comando dentro de um servidor.'));
+  const n = i.commandName;
+  if ((n === 'painel' || n === 'partida') && !isAdmin(i)) return i.reply(eph('Apenas administradores (permissão Gerenciar Servidor) podem usar este comando.'));
+  if (n === 'painel') return cmdPainel(i, c);
+  if (n === 'ranking') return cmdRanking(i);
+  if (n === 'historico') return cmdHistorico(i);
+  if (n === 'partida') return cmdPartida(i, c);
+}
+
+/* ---------- testes: npm test ---------- */
+if (process.argv.includes('--test')) {
+  const assert = require('assert');
+  assert.strictEqual(VALUES.length, 23);
+  assert.deepStrictEqual(parseValues('5,1,1').values, [1, 5]);
+  assert.strictEqual(parseValues('4').ok, false);
+  const a = newQueue('g', 'c', 'mobile', 5);
+  const b = newQueue('g', 'c', 'mobile', 10);
+  assert.ok(!join(a.id, 'g', 'A').err);
+  assert.strictEqual(join(a.id, 'g', 'A').err, 'here');
+  assert.strictEqual(join(b.id, 'g', 'A').err, 'busy');
+  const m = join(a.id, 'g', 'B').match;
+  assert.strictEqual(join(a.id, 'g', 'C').err, 'full');
+  confirm(m.id, 'g', 'A');
+  assert.strictEqual(confirm(m.id, 'g', 'B').match.status, 'active');
+  report(m.id, 'g', 'A', 'win');
+  assert.strictEqual(report(m.id, 'g', 'B', 'win').match.status, 'disputed');
+  assert.strictEqual(resolve(m.id, 'g', 'A').match.status, 'finished');
+  assert.deepStrictEqual(ranking('g', 5).map((r) => [r.uid, r.wins, r.losses]), [['A', 1, 0], ['B', 0, 1]]);
+  assert.strictEqual(queueView(a).embeds[0].toJSON().title, 'Filas eFootball');
+  console.log('✅ Testes ok');
+  process.exit(0);
+}
+
+/* ---------- inicialização ---------- */
+const { DISCORD_TOKEN, GUILD_ID } = process.env;
+if (!DISCORD_TOKEN) { console.error('Defina DISCORD_TOKEN nas variáveis de ambiente.'); process.exit(1); }
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+client.once(Events.ClientReady, async (c) => {
+  console.log(`Online como ${c.user.tag}`);
+  try {
+    await (GUILD_ID ? c.application.commands.set(commands, GUILD_ID) : c.application.commands.set(commands));
+    console.log('Comandos registrados.');
+  } catch (e) { console.error('Falha ao registrar comandos:', e); }
+});
+
+client.on(Events.InteractionCreate, async (i) => {
+  try {
+    if (i.isChatInputCommand()) await onCommand(i, client);
+    else if (i.isButton()) await onButton(i, client);
+  } catch (err) {
+    console.error('Erro na interação:', err);
+    const msg = eph('❌ Ocorreu um erro. Tente novamente em instantes.');
+    try { await (i.deferred || i.replied ? i.followUp(msg) : i.reply(msg)); } catch { /* expirada */ }
+  }
+});
+
+client.on(Events.Error, (e) => console.error('Erro do client:', e));
+
+http.createServer((_, res) => { res.writeHead(200); res.end('ok'); }).listen(process.env.PORT || 3000);
+process.on('SIGTERM', () => { client.destroy(); process.exit(0); });
+
+client.login(DISCORD_TOKEN).catch((e) => { console.error('Falha no login:', e.message); process.exit(1); });
