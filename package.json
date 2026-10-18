@@ -1,17 +1,16 @@
-
 {
-  "name": "organizador-efootball",
+  "name": "efootball-filas-bot",
   "version": "1.0.0",
-  "description": "Bot para organizar servidor Discord de eFootball",
+  "private": true,
   "main": "index.js",
+  "engines": { "node": ">=18.17" },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js"
+    "test": "node index.js --test"
   },
   "dependencies": {
-    "discord.js": "^14.22.1"
-  },
-  "engines": {
-    "node": ">=20.11.0"
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "pg": "^8.12.0"
   }
 }
